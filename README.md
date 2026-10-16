@@ -14,7 +14,8 @@ A high-performance, distributed key-value store built in Go, powered by the **Ra
 
 ## Architecture
 
-The system consists of multiple nodes, each running an instance of the Raft FSM (Finite State Machine). 
+The system consists of multiple nodes, each running an instance of the Raft FSM (Finite State Machine).
+
 * **Leader:** Handles all client requests and replicates log entries to followers.
 * **Followers:** Replicate the leader's log and step up for election if the leader fails.
 * **Storage:** Uses an LSM-tree or BoltDB backend (standardize based on your implementation) for persistent storage.
@@ -25,7 +26,7 @@ The system consists of multiple nodes, each running an instance of the Raft FSM 
 
 ### Prerequisites
 
-* Go 1.21+ 
+* Go 1.21+
 * `protoc` (if using gRPC)
 
 ### Installation
