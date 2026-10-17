@@ -1,8 +1,12 @@
 # Go-Raft KV 🚀
 
-A high-performance, distributed key-value store built in Go, powered by the **Raft Consensus Algorithm**. This project ensures strong consistency and high availability across a cluster of nodes.
+A learning project implementing the **Raft Consensus Algorithm** in Go, with a distributed key-value store as the eventual application.
 
-## Features
+Currently implemented: a `ConsensusModule` identity scaffold in `raft.go` and a TCP `net/rpc` transport wrapper in `server.go`. No Raft RPC handlers, elections, replication, persistence, or key-value operations exist yet.
+
+Run scaffold checks with `go test -race ./...`. This is currently a library package, with no executable entry point.
+
+## Planned features (not implemented)
 
 * **Strong Consistency:** Linearizable reads and writes via the Raft protocol.
 * **Fault Tolerance:** The cluster remains operational as long as a quorum (majority) of nodes are healthy.
@@ -12,7 +16,7 @@ A high-performance, distributed key-value store built in Go, powered by the **Ra
 
 ---
 
-## Architecture
+## Intended architecture
 
 The system consists of multiple nodes, each running an instance of the Raft FSM (Finite State Machine).
 
@@ -35,4 +39,5 @@ The system consists of multiple nodes, each running an instance of the Raft FSM 
 git clone https://github.com/saharshmaloo/raft_kv.git
 cd raft_kv
 go mod tidy
-go build -o raft_kv
+go test -race ./...
+```
