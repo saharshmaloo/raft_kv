@@ -5,10 +5,11 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
+	"time"
 )
 
-// Server owns transport resources. ConsensusModule uses Call without knowing
-// peer addresses or managing network connections.
+// Server owns transport resources and drives the consensus clock.
+// ConsensusModule uses Call without knowing peer addresses or managing connections.
 type Server struct {
 	mu          sync.Mutex
 	cm          *ConsensusModule
@@ -17,6 +18,7 @@ type Server struct {
 	peers       map[int]*rpc.Client
 	connections map[net.Conn]struct{}
 	closed      bool
+	done        chan struct{}
 	wg          sync.WaitGroup
 }
 
@@ -25,14 +27,14 @@ func NewServer(id int, peerIds []int) *Server {
 		rpcServer:   rpc.NewServer(),
 		peers:       make(map[int]*rpc.Client),
 		connections: make(map[net.Conn]struct{}),
+		done:        make(chan struct{}),
 	}
 	s.cm = newConsensusModule(id, peerIds, s)
-	// Register the CM with rpcServer once it has Raft RPC handlers.
 	return s
 }
 
-// Serve takes ownership of listener and starts accepting RPC connections.
-// No Raft RPC methods are registered in this initial scaffold.
+// Serve takes ownership of listener, starts accepting RPC connections, and
+// starts the election timer. Construction alone does not start elections.
 func (s *Server) Serve(listener net.Listener) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -40,6 +42,16 @@ func (s *Server) Serve(listener net.Listener) error {
 		return fmt.Errorf("server is closed or already serving")
 	}
 	s.listener = listener
+	s.cm.mu.Lock()
+	s.cm.resetElectionTimerLocked(time.Now())
+	s.cm.mu.Unlock()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer ticker.Stop()
+		s.cm.runElectionTimer(ticker.C, s.done)
+	}()
 	s.wg.Add(1)
 	go s.accept()
 	return nil
@@ -110,11 +122,14 @@ func (s *Server) Call(peerID int, method string, args, reply any) error {
 	return client.Call(method, args, reply)
 }
 
-// Shutdown closes transport resources and waits for incoming connections to
-// finish. It is safe to call more than once.
+// Shutdown stops the election timer, closes transport resources, and waits for
+// all server goroutines to finish. It is safe to call more than once.
 func (s *Server) Shutdown() {
 	s.mu.Lock()
-	s.closed = true
+	if !s.closed {
+		s.closed = true
+		close(s.done)
+	}
 	if s.listener != nil {
 		s.listener.Close()
 	}

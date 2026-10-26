@@ -11,11 +11,20 @@ func TestServerLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := NewServer(1, []int{2})
+	if !s.cm.electionDeadline.IsZero() {
+		t.Fatal("election timer started before Serve")
+	}
 	if err := s.Serve(listener); err != nil {
 		listener.Close()
 		t.Fatal(err)
 	}
 	defer s.Shutdown()
+	s.cm.mu.Lock()
+	timerStarted := !s.cm.electionDeadline.IsZero()
+	s.cm.mu.Unlock()
+	if !timerStarted {
+		t.Fatal("Serve did not initialize the election timer")
+	}
 	peer := NewServer(2, []int{1})
 	defer peer.Shutdown()
 	if err := peer.ConnectToPeer(1, listener.Addr().String()); err != nil {
@@ -23,6 +32,11 @@ func TestServerLifecycle(t *testing.T) {
 	}
 	s.Shutdown()
 	s.Shutdown()
+	select {
+	case <-s.done:
+	default:
+		t.Fatal("Shutdown did not signal the election timer to stop")
+	}
 	if err := s.Call(2, "ConsensusModule.RequestVote", nil, nil); err == nil {
 		t.Fatal("closed server accepted a call")
 	}
