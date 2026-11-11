@@ -1,26 +1,29 @@
-# Go-Raft KV 🚀
+# Raft KV
 
-A learning project implementing the **Raft Consensus Algorithm** in Go for a distributed key-value store.
+A Go implementation of the [Raft consensus algorithm](https://raft.github.io/raft.pdf) for a distributed key-value store.
 
-`ConsensusModule` in `raft.go` holds the protocol logic; `Server` in `server.go` manages TCP `net/rpc` connections and drives the consensus clock.
+The project separates consensus logic from RPC networking so protocol behavior can be tested independently.
 
-Serving a node starts its election timer with a timeout in [150ms, 300ms), checked every 10ms. On timeout it becomes a candidate, increments its term, votes for itself, and chooses a fresh timeout for another attempt. Shutdown stops the timer and waits for its goroutine. The timeout range follows the example in the [Raft paper, §5.2](https://raft.github.io/raft.pdf).
+## How Raft works
 
-Timer tests advance time explicitly, without sleeps.
+Raft helps a group of nodes agree on an ordered sequence of operations, even when some nodes fail or lose connectivity. Each node keeps a log of operations and applies committed entries in the same order to maintain a consistent state.
 
-Run tests with `go test -race ./...`.
+- **Leader election:** Nodes act as followers, candidates, or leaders. Followers expect regular heartbeats from a leader. If those stop arriving, a follower becomes a candidate and requests votes. A majority elects a leader. Elections take place in numbered terms, allowing nodes to recognize outdated leadership.
+- **Log replication:** The leader accepts client operations and sends log entries to followers. Once an entry from the leader's term is stored on a majority, the leader can commit it along with preceding entries. Nodes apply committed operations to their state machines—for a key-value store, these operations update stored data.
+- **Safety and recovery:** Voting rules require candidates to have sufficiently up-to-date logs, and replication repairs conflicting entries. These rules preserve committed operations across leader changes. A partition without a majority cannot commit new operations; progress resumes when a majority can communicate and elect a leader.
 
-## Getting Started
+## Project layout
 
-### Prerequisites
+- `raft.go` — node state, election timing, and voting.
+- `server.go` — peer connections, RPC transport, and server lifecycle.
+- `*_test.go` — protocol and transport tests.
 
-* Go 1.21+
+## Getting started
 
-### Installation
+Requires Go 1.21 or later.
 
-```bash
+```sh
 git clone https://github.com/saharshmaloo/raft_kv.git
 cd raft_kv
-go mod tidy
 go test -race ./...
 ```

@@ -30,7 +30,31 @@ func NewServer(id int, peerIds []int) *Server {
 		done:        make(chan struct{}),
 	}
 	s.cm = newConsensusModule(id, peerIds, s)
+	if err := s.rpcServer.RegisterName("ConsensusModule", s.cm); err != nil {
+		panic(err) // A fixed service name/type failing registration is a programming error.
+	}
 	return s
+}
+
+// requestVote owns each outgoing election goroutine so Shutdown can close its
+// connection and wait for the reply handler to finish. Add is guarded by mu to
+// prevent starting new work once Shutdown begins waiting.
+func (s *Server) requestVote(peerID int, args RequestVoteArgs) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.wg.Done()
+		var reply RequestVoteReply
+		if err := s.Call(peerID, "ConsensusModule.RequestVote", args, &reply); err != nil {
+			return // A failed RPC is not a vote; the next timeout retries the election.
+		}
+		s.cm.handleRequestVoteReply(peerID, args.Term, reply)
+	}()
 }
 
 // Serve takes ownership of listener, starts accepting RPC connections, and

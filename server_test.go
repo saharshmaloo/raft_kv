@@ -2,7 +2,9 @@ package raft
 
 import (
 	"net"
+	"net/rpc"
 	"testing"
+	"time"
 )
 
 func TestServerLifecycle(t *testing.T) {
@@ -39,6 +41,52 @@ func TestServerLifecycle(t *testing.T) {
 	}
 	if err := s.Call(2, "ConsensusModule.RequestVote", nil, nil); err == nil {
 		t.Fatal("closed server accepted a call")
+	}
+}
+
+func TestElectionRequestsVotesOverRPC(t *testing.T) {
+	s := NewServer(1, []int{2, 3})
+	t.Cleanup(s.Shutdown)
+	peers := []*Server{NewServer(2, nil), NewServer(3, nil)}
+	for _, peer := range peers {
+		peer := peer // This module targets Go 1.21's shared range variables.
+		// In-memory connections exercise the real RPC service without timers
+		// or sleeps. Each peer starts with an empty log and no prior vote.
+		local, remote := net.Pipe()
+		s.peers[peer.cm.id] = rpc.NewClient(local)
+		finished := make(chan struct{})
+		go func() {
+			defer close(finished)
+			peer.rpcServer.ServeConn(remote)
+		}()
+		t.Cleanup(func() {
+			local.Close()
+			remote.Close()
+			<-finished
+		})
+	}
+	s.cm.tickElection(time.Unix(0, 0))
+	s.wg.Wait() // Both outgoing calls and their reply handlers have completed.
+	if s.cm.state != Leader || s.cm.currentTerm != 1 {
+		t.Fatal("RPC votes did not elect the candidate")
+	}
+	for _, peer := range peers {
+		peer.cm.mu.Lock()
+		votedFor, term := peer.cm.votedFor, peer.cm.currentTerm
+		peer.cm.mu.Unlock()
+		if votedFor != 1 || term != 1 {
+			t.Fatal("candidate did not request a vote from every peer")
+		}
+	}
+}
+
+func TestFailedVoteRPCLeavesCandidate(t *testing.T) {
+	s := NewServer(1, []int{2, 3})
+	defer s.Shutdown()
+	s.cm.tickElection(time.Unix(0, 0))
+	s.wg.Wait()
+	if s.cm.state != Candidate || len(s.cm.votesReceived) != 1 {
+		t.Fatal("disconnected peers must not count as votes")
 	}
 }
 
