@@ -25,6 +25,20 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// AppendEntriesArgs carries a leader heartbeat for an empty log.
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderID int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+// Heartbeats leave room for multiple deliveries before the shortest election timeout.
+const heartbeatInterval = 50 * time.Millisecond
+
 // ConsensusModule holds the Raft protocol logic for one replica.
 type ConsensusModule struct {
 	mu      sync.Mutex
@@ -37,10 +51,11 @@ type ConsensusModule struct {
 	votedFor    int // -1 means no vote in the current term.
 
 	// Volatile state. mu protects this state and the term/vote above.
-	state            CMState
-	electionDeadline time.Time
-	electionTimeout  func() time.Duration
-	votesReceived    map[int]bool // Grants in currentTerm, including our own vote.
+	state             CMState
+	electionDeadline  time.Time
+	electionTimeout   func() time.Duration
+	votesReceived     map[int]bool // Grants in currentTerm, including our own vote.
+	heartbeatDeadline time.Time
 }
 
 func newConsensusModule(id int, peerIds []int, server *Server) *ConsensusModule {
@@ -68,7 +83,12 @@ func (cm *ConsensusModule) resetElectionTimerLocked(now time.Time) {
 // tickElection accepts time explicitly so protocol tests need no real sleeps.
 func (cm *ConsensusModule) tickElection(now time.Time) {
 	cm.mu.Lock()
-	if cm.state == Leader || now.Before(cm.electionDeadline) {
+	if cm.state == Leader {
+		cm.mu.Unlock()
+		cm.sendHeartbeats(now)
+		return
+	}
+	if now.Before(cm.electionDeadline) {
 		cm.mu.Unlock()
 		return
 	}
@@ -79,8 +99,12 @@ func (cm *ConsensusModule) tickElection(now time.Time) {
 	cm.votesReceived = map[int]bool{cm.id: true}
 	cm.resetElectionTimerLocked(now)
 	args := RequestVoteArgs{Term: cm.currentTerm, CandidateID: cm.id}
-	cm.becomeLeaderIfMajorityLocked()
+	elected := cm.becomeLeaderIfMajorityLocked()
 	cm.mu.Unlock()
+	if elected {
+		cm.sendHeartbeats(now)
+		return
+	}
 
 	// Network calls run independently: an unreachable peer must not block the
 	// timer, incoming RPCs, or a majority of other peers from electing us.
@@ -100,28 +124,87 @@ func (cm *ConsensusModule) becomeFollowerLocked(term int) {
 	cm.votesReceived = nil
 }
 
-func (cm *ConsensusModule) becomeLeaderIfMajorityLocked() {
+func (cm *ConsensusModule) becomeLeaderIfMajorityLocked() bool {
 	if len(cm.votesReceived) > (len(cm.peerIds)+1)/2 {
 		cm.state = Leader
+		cm.heartbeatDeadline = time.Time{}
+		return true
 	}
+	return false
 }
 
 // handleRequestVoteReply accepts the election term separately so a delayed
 // grant cannot be counted in a later election.
 func (cm *ConsensusModule) handleRequestVoteReply(peerID, electionTerm int, reply RequestVoteReply) {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
 	// Even a reply from an old election can teach us about a newer term.
 	if reply.Term > cm.currentTerm {
 		cm.becomeFollowerLocked(reply.Term)
+		cm.mu.Unlock()
 		return
 	}
 	if cm.state != Candidate || cm.currentTerm != electionTerm || reply.Term != electionTerm {
+		cm.mu.Unlock()
 		return
 	}
+	elected := false
 	if reply.VoteGranted {
 		cm.votesReceived[peerID] = true
-		cm.becomeLeaderIfMajorityLocked()
+		elected = cm.becomeLeaderIfMajorityLocked()
+	}
+	cm.mu.Unlock()
+	if elected {
+		// Announce leadership immediately, before followers' election timers expire.
+		cm.sendHeartbeats(time.Now())
+	}
+}
+
+func (cm *ConsensusModule) sendHeartbeats(now time.Time) {
+	cm.mu.Lock()
+	if cm.state != Leader || now.Before(cm.heartbeatDeadline) {
+		cm.mu.Unlock()
+		return
+	}
+	cm.heartbeatDeadline = now.Add(heartbeatInterval)
+	args := AppendEntriesArgs{Term: cm.currentTerm, LeaderID: cm.id}
+	cm.mu.Unlock()
+	if cm.server != nil {
+		for _, peerID := range cm.peerIds {
+			cm.server.sendHeartbeat(peerID, args)
+		}
+	}
+}
+
+// AppendEntries recognizes leader contact and postpones the receiver's election.
+func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	return cm.appendEntries(args, reply, time.Now())
+}
+
+func (cm *ConsensusModule) appendEntries(args AppendEntriesArgs, reply *AppendEntriesReply, now time.Time) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if args.Term > cm.currentTerm {
+		cm.becomeFollowerLocked(args.Term)
+	}
+	reply.Term = cm.currentTerm
+	reply.Success = false
+	if args.Term < cm.currentTerm {
+		return nil
+	}
+	// Same-term leader contact ends candidacy without clearing the vote:
+	// clearing it would allow a second candidate to receive a vote in this term.
+	cm.state = Follower
+	cm.votesReceived = nil
+	cm.resetElectionTimerLocked(now)
+	reply.Success = true
+	return nil
+}
+
+func (cm *ConsensusModule) handleAppendEntriesReply(reply AppendEntriesReply) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if reply.Term > cm.currentTerm {
+		cm.becomeFollowerLocked(reply.Term)
 	}
 }
 

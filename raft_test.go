@@ -229,3 +229,93 @@ func TestHigherTermRequestStepsDown(t *testing.T) {
 		t.Fatal("a higher-term request must make a candidate step down")
 	}
 }
+
+func TestAppendEntries(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		state     CMState
+		term      int
+		wantTerm  int
+		wantVote  int
+		wantState CMState
+		accepted  bool
+	}{
+		{"stale heartbeat", Candidate, 1, 2, 1, Candidate, false},
+		{"same term follower", Follower, 2, 2, 1, Follower, true},
+		{"same term candidate", Candidate, 2, 2, 1, Follower, true},
+		{"higher term candidate", Candidate, 3, 3, -1, Follower, true},
+		{"higher term leader", Leader, 3, 3, -1, Follower, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cm, now := newTimerTestModule()
+			cm.state, cm.currentTerm, cm.votedFor = test.state, 2, 1
+			cm.votesReceived = map[int]bool{1: true}
+			deadline := cm.electionDeadline
+			var reply AppendEntriesReply
+			if err := cm.appendEntries(AppendEntriesArgs{Term: test.term, LeaderID: 2}, &reply, now.Add(100*time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			if reply.Term != test.wantTerm || reply.Success != test.accepted || cm.currentTerm != test.wantTerm || cm.state != test.wantState || cm.votedFor != test.wantVote {
+				t.Fatalf("unexpected heartbeat result: reply=%+v state=%v term=%d vote=%d", reply, cm.state, cm.currentTerm, cm.votedFor)
+			}
+			if test.accepted {
+				deadline = now.Add(250 * time.Millisecond)
+				if cm.votesReceived != nil {
+					t.Fatal("leader contact did not discard election grants")
+				}
+			}
+			if !cm.electionDeadline.Equal(deadline) {
+				t.Fatal("heartbeat changed the election deadline incorrectly")
+			}
+		})
+	}
+}
+
+func TestHeartbeatsPreventElectionUntilContactStops(t *testing.T) {
+	cm, now := newTimerTestModule()
+	for elapsed := heartbeatInterval; elapsed <= time.Second; elapsed += heartbeatInterval {
+		at := now.Add(elapsed)
+		var reply AppendEntriesReply
+		cm.appendEntries(AppendEntriesArgs{Term: 1, LeaderID: 2}, &reply, at)
+		cm.tickElection(at)
+		if cm.state != Follower || cm.currentTerm != 1 {
+			t.Fatal("follower started an election despite regular heartbeats")
+		}
+	}
+	cm.tickElection(now.Add(time.Second + 150*time.Millisecond))
+	if cm.state != Candidate || cm.currentTerm != 2 {
+		t.Fatal("follower did not start an election after heartbeats stopped")
+	}
+}
+
+func TestHeartbeatSchedule(t *testing.T) {
+	cm, now := newTimerTestModule()
+	cm.state, cm.currentTerm = Leader, 1
+	cm.tickElection(now)
+	want := now.Add(heartbeatInterval)
+	if !cm.heartbeatDeadline.Equal(want) {
+		t.Fatal("leader did not schedule its next heartbeat")
+	}
+	cm.tickElection(want.Add(-time.Millisecond))
+	if !cm.heartbeatDeadline.Equal(want) {
+		t.Fatal("leader sent a heartbeat before the interval elapsed")
+	}
+	cm.tickElection(want)
+	if !cm.heartbeatDeadline.Equal(want.Add(heartbeatInterval)) {
+		t.Fatal("leader did not schedule a periodic heartbeat")
+	}
+}
+
+func TestHeartbeatReplyHigherTermStepsDown(t *testing.T) {
+	cm, _ := newTimerTestModule()
+	cm.state, cm.currentTerm, cm.votedFor = Leader, 2, 1
+	deadline := cm.electionDeadline
+	cm.handleAppendEntriesReply(AppendEntriesReply{Term: 1, Success: true})
+	if cm.state != Leader || cm.currentTerm != 2 {
+		t.Fatal("stale heartbeat reply changed leadership")
+	}
+	cm.handleAppendEntriesReply(AppendEntriesReply{Term: 3})
+	if cm.state != Follower || cm.currentTerm != 3 || cm.votedFor != -1 || !cm.electionDeadline.Equal(deadline) {
+		t.Fatal("higher-term heartbeat reply must step down without resetting the timer")
+	}
+}

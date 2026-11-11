@@ -17,6 +17,7 @@ type Server struct {
 	listener    net.Listener
 	peers       map[int]*rpc.Client
 	connections map[net.Conn]struct{}
+	heartbeats  map[int]bool
 	closed      bool
 	done        chan struct{}
 	wg          sync.WaitGroup
@@ -27,6 +28,7 @@ func NewServer(id int, peerIds []int) *Server {
 		rpcServer:   rpc.NewServer(),
 		peers:       make(map[int]*rpc.Client),
 		connections: make(map[net.Conn]struct{}),
+		heartbeats:  make(map[int]bool),
 		done:        make(chan struct{}),
 	}
 	s.cm = newConsensusModule(id, peerIds, s)
@@ -54,6 +56,31 @@ func (s *Server) requestVote(peerID int, args RequestVoteArgs) {
 			return // A failed RPC is not a vote; the next timeout retries the election.
 		}
 		s.cm.handleRequestVoteReply(peerID, args.Term, reply)
+	}()
+}
+
+func (s *Server) sendHeartbeat(peerID int, args AppendEntriesArgs) {
+	s.mu.Lock()
+	// A stalled peer must not accumulate a goroutine on every heartbeat interval.
+	if s.closed || s.heartbeats[peerID] {
+		s.mu.Unlock()
+		return
+	}
+	s.heartbeats[peerID] = true
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.wg.Done()
+		defer func() {
+			s.mu.Lock()
+			delete(s.heartbeats, peerID)
+			s.mu.Unlock()
+		}()
+		var reply AppendEntriesReply
+		if err := s.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err != nil {
+			return
+		}
+		s.cm.handleAppendEntriesReply(reply)
 	}()
 }
 
