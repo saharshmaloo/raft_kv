@@ -196,11 +196,11 @@ func TestRequestVote(t *testing.T) {
 		wantVote  int
 		wantGrant bool
 	}{
-		{"stale term", 2, -1, RequestVoteArgs{1, 2}, 2, -1, false},
-		{"first vote", 2, -1, RequestVoteArgs{2, 2}, 2, 2, true},
-		{"repeat vote", 2, 2, RequestVoteArgs{2, 2}, 2, 2, true},
-		{"already voted", 2, 3, RequestVoteArgs{2, 2}, 2, 3, false},
-		{"higher term clears vote", 2, 3, RequestVoteArgs{3, 2}, 3, 2, true},
+		{"stale term", 2, -1, RequestVoteArgs{Term: 1, CandidateID: 2}, 2, -1, false},
+		{"first vote", 2, -1, RequestVoteArgs{Term: 2, CandidateID: 2}, 2, 2, true},
+		{"repeat vote", 2, 2, RequestVoteArgs{Term: 2, CandidateID: 2}, 2, 2, true},
+		{"already voted", 2, 3, RequestVoteArgs{Term: 2, CandidateID: 2}, 2, 3, false},
+		{"higher term clears vote", 2, 3, RequestVoteArgs{Term: 3, CandidateID: 2}, 3, 2, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cm, _ := newTimerTestModule()

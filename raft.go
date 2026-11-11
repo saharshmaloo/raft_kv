@@ -14,10 +14,13 @@ const (
 	Leader
 )
 
-// RequestVoteArgs identifies the candidate and election term.
+// RequestVoteArgs includes the candidate's last log position so a voter can
+// compare log freshness by term, then by index.
 type RequestVoteArgs struct {
-	Term        int
-	CandidateID int
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 type RequestVoteReply struct {
@@ -25,10 +28,21 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// AppendEntriesArgs carries a leader heartbeat for an empty log.
+// LogEntry associates an opaque state-machine command with its election term.
+type LogEntry struct {
+	Term    int
+	Command []byte
+}
+
+// AppendEntriesArgs identifies the log prefix preceding Entries. An empty
+// Entries slice represents a heartbeat. Log indexes start at 1; 0 denotes no entry.
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderID int
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
