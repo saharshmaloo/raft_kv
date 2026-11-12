@@ -102,8 +102,10 @@ func (cm *ConsensusModule) resetElectionTimerLocked(now time.Time) {
 	cm.electionDeadline = now.Add(cm.electionTimeout())
 }
 
-// tickElection accepts time explicitly so protocol tests need no real sleeps.
-func (cm *ConsensusModule) tickElection(now time.Time) {
+// tick drives time-based Raft work: leaders send heartbeats when due, while
+// followers and candidates start a new election when their deadline expires.
+// Passing time explicitly lets tests exercise deadlines without real sleeps.
+func (cm *ConsensusModule) tick(now time.Time) {
 	cm.mu.Lock()
 	if cm.stopped {
 		cm.mu.Unlock()
@@ -296,8 +298,8 @@ func (cm *ConsensusModule) sendHeartbeat(peerID int, args AppendEntriesArgs) {
 	}()
 }
 
-// start initializes the deadline before launching the clock, so the first tick
-// waits for a full election timeout. Construction alone does not start elections.
+// start initializes the election deadline before launching the ticker that drives
+// elections and heartbeats, so a follower waits a full timeout before campaigning.
 func (cm *ConsensusModule) start() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -311,7 +313,7 @@ func (cm *ConsensusModule) start() {
 	go func() {
 		defer cm.wg.Done()
 		defer ticker.Stop()
-		cm.runElectionTimer(ticker.C, cm.done)
+		cm.runTicker(ticker.C, cm.done)
 	}()
 }
 
@@ -327,8 +329,9 @@ func (cm *ConsensusModule) stop() {
 	cm.wg.Wait()
 }
 
-// runElectionTimer adapts clock ticks to protocol logic; tests can supply ticks directly.
-func (cm *ConsensusModule) runElectionTimer(ticks <-chan time.Time, stop <-chan struct{}) {
+// runTicker delivers clock ticks to Raft protocol logic until stopped or the
+// tick channel closes. Tests can supply ticks directly to control time.
+func (cm *ConsensusModule) runTicker(ticks <-chan time.Time, stop <-chan struct{}) {
 	for {
 		select {
 		case <-stop:
@@ -337,7 +340,7 @@ func (cm *ConsensusModule) runElectionTimer(ticks <-chan time.Time, stop <-chan 
 			if !ok {
 				return
 			}
-			cm.tickElection(now)
+			cm.tick(now)
 		}
 	}
 }

@@ -34,7 +34,8 @@ func NewServer(id int, peerIds []int) *Server {
 }
 
 // Serve takes ownership of listener, starts accepting RPC connections, and
-// starts the election timer. Construction alone does not start elections.
+// starts the consensus ticker for elections and heartbeats. Construction alone
+// does not start consensus.
 func (s *Server) Serve(listener net.Listener) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

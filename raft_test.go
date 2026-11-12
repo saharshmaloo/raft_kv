@@ -15,11 +15,11 @@ func newTimerTestModule() (*ConsensusModule, time.Time) {
 
 func TestElectionTimeout(t *testing.T) {
 	cm, now := newTimerTestModule()
-	cm.tickElection(now.Add(149 * time.Millisecond))
+	cm.tick(now.Add(149 * time.Millisecond))
 	if cm.state != Follower || cm.currentTerm != 0 || cm.votedFor != -1 {
 		t.Fatal("election started before the deadline")
 	}
-	cm.tickElection(now.Add(150 * time.Millisecond))
+	cm.tick(now.Add(150 * time.Millisecond))
 	if cm.state != Candidate || cm.currentTerm != 1 || cm.votedFor != cm.id {
 		t.Fatal("timeout must become candidate, increment term, and vote for self")
 	}
@@ -28,12 +28,12 @@ func TestElectionTimeout(t *testing.T) {
 func TestCandidateRetriesWithFreshTimeout(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.electionTimeout = func() time.Duration { return 250 * time.Millisecond }
-	cm.tickElection(now.Add(150 * time.Millisecond))
-	cm.tickElection(now.Add(399 * time.Millisecond))
+	cm.tick(now.Add(150 * time.Millisecond))
+	cm.tick(now.Add(399 * time.Millisecond))
 	if cm.currentTerm != 1 {
 		t.Fatal("candidate retried before the newly sampled deadline")
 	}
-	cm.tickElection(now.Add(400 * time.Millisecond))
+	cm.tick(now.Add(400 * time.Millisecond))
 	if cm.state != Candidate || cm.currentTerm != 2 || cm.votedFor != cm.id {
 		t.Fatal("candidate must retry in a new term and vote for self")
 	}
@@ -44,11 +44,11 @@ func TestElectionTimerReset(t *testing.T) {
 	cm.mu.Lock()
 	cm.resetElectionTimerLocked(now.Add(100 * time.Millisecond))
 	cm.mu.Unlock()
-	cm.tickElection(now.Add(150 * time.Millisecond))
+	cm.tick(now.Add(150 * time.Millisecond))
 	if cm.state != Follower {
 		t.Fatal("old deadline triggered an election after reset")
 	}
-	cm.tickElection(now.Add(250 * time.Millisecond))
+	cm.tick(now.Add(250 * time.Millisecond))
 	if cm.state != Candidate || cm.currentTerm != 1 {
 		t.Fatal("reset deadline did not trigger an election")
 	}
@@ -58,7 +58,7 @@ func TestLeaderIgnoresElectionTimeout(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.state = Leader
 	cm.currentTerm = 3
-	cm.tickElection(now.Add(time.Hour))
+	cm.tick(now.Add(time.Hour))
 	if cm.state != Leader || cm.currentTerm != 3 || cm.votedFor != -1 {
 		t.Fatal("leader started an election")
 	}
@@ -67,8 +67,8 @@ func TestLeaderIgnoresElectionTimeout(t *testing.T) {
 func TestDelayedTickStartsOnlyOneElection(t *testing.T) {
 	cm, now := newTimerTestModule()
 	late := now.Add(time.Hour)
-	cm.tickElection(late)
-	cm.tickElection(late)
+	cm.tick(late)
+	cm.tick(late)
 	if cm.currentTerm != 1 || !cm.electionDeadline.Equal(late.Add(150*time.Millisecond)) {
 		t.Fatal("delayed tick must begin one election with a fresh full timeout")
 	}
@@ -84,14 +84,14 @@ func TestRandomElectionTimeoutRange(t *testing.T) {
 	}
 }
 
-func TestElectionTimerLoop(t *testing.T) {
+func TestTickerLoop(t *testing.T) {
 	cm, now := newTimerTestModule()
 	ticks := make(chan time.Time)
 	stop := make(chan struct{})
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		cm.runElectionTimer(ticks, stop)
+		cm.runTicker(ticks, stop)
 	}()
 	// The second send ensures the loop has processed the first tick.
 	ticks <- now.Add(150 * time.Millisecond)
@@ -99,25 +99,25 @@ func TestElectionTimerLoop(t *testing.T) {
 	close(stop)
 	<-finished
 	if cm.state != Candidate || cm.currentTerm != 1 {
-		t.Fatal("timer loop did not deliver the timeout")
+		t.Fatal("ticker loop did not deliver the timeout")
 	}
 }
 
-func TestElectionTimerLoopAlreadyStopped(t *testing.T) {
+func TestTickerLoopAlreadyStopped(t *testing.T) {
 	cm, _ := newTimerTestModule()
 	stop := make(chan struct{})
 	close(stop)
-	cm.runElectionTimer(make(chan time.Time), stop)
+	cm.runTicker(make(chan time.Time), stop)
 	if cm.state != Follower || cm.currentTerm != 0 {
-		t.Fatal("stopped timer changed consensus state")
+		t.Fatal("stopped ticker changed consensus state")
 	}
 }
 
-func TestConsensusTimerLifecycle(t *testing.T) {
+func TestConsensusTickerLifecycle(t *testing.T) {
 	cm := newConsensusModule(1, nil, nil)
 	t.Cleanup(cm.stop)
 	if !cm.electionDeadline.IsZero() {
-		t.Fatal("construction started the election timer")
+		t.Fatal("construction initialized the election deadline")
 	}
 	cm.start()
 	cm.mu.Lock()
@@ -131,18 +131,18 @@ func TestConsensusTimerLifecycle(t *testing.T) {
 	unchanged := cm.electionDeadline.Equal(deadline)
 	cm.mu.Unlock()
 	if !unchanged {
-		t.Fatal("starting consensus twice reset the election timer")
+		t.Fatal("starting consensus twice reset the election deadline")
 	}
 	cm.stop()
 	cm.stop()
 	select {
 	case <-cm.done:
 	default:
-		t.Fatal("stopping consensus did not signal the timer")
+		t.Fatal("stopping consensus did not signal the ticker")
 	}
 	term := cm.currentTerm
 	cm.start()
-	cm.tickElection(deadline.Add(time.Hour))
+	cm.tick(deadline.Add(time.Hour))
 	if cm.currentTerm != term {
 		t.Fatal("stopped consensus restarted an election")
 	}
@@ -153,13 +153,13 @@ func TestConsensusStopBeforeStart(t *testing.T) {
 	cm.stop()
 	cm.start()
 	if !cm.electionDeadline.IsZero() {
-		t.Fatal("stopped consensus started its election timer")
+		t.Fatal("stopped consensus initialized its election deadline")
 	}
 }
 
 func TestSingleNodeElectsItself(t *testing.T) {
 	cm := newConsensusModule(1, nil, nil)
-	cm.tickElection(time.Unix(0, 0))
+	cm.tick(time.Unix(0, 0))
 	if cm.state != Leader || cm.currentTerm != 1 || cm.votedFor != 1 {
 		t.Fatal("a single node's self-vote is a majority")
 	}
@@ -168,7 +168,7 @@ func TestSingleNodeElectsItself(t *testing.T) {
 func TestCandidateNeedsDistinctMajority(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.peerIds = []int{2, 3, 4, 5}
-	cm.tickElection(now.Add(150 * time.Millisecond))
+	cm.tick(now.Add(150 * time.Millisecond))
 	cm.handleRequestVoteReply(2, 1, RequestVoteReply{Term: 1, VoteGranted: true})
 	cm.handleRequestVoteReply(2, 1, RequestVoteReply{Term: 1, VoteGranted: true})
 	cm.handleRequestVoteReply(3, 1, RequestVoteReply{Term: 1})
@@ -184,7 +184,7 @@ func TestCandidateNeedsDistinctMajority(t *testing.T) {
 func TestEvenClusterNeedsMoreThanHalf(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.peerIds = []int{2, 3, 4}
-	cm.tickElection(now.Add(150 * time.Millisecond))
+	cm.tick(now.Add(150 * time.Millisecond))
 	cm.handleRequestVoteReply(2, 1, RequestVoteReply{Term: 1, VoteGranted: true})
 	if cm.state != Candidate {
 		t.Fatal("two votes out of four is not a majority")
@@ -197,8 +197,8 @@ func TestEvenClusterNeedsMoreThanHalf(t *testing.T) {
 
 func TestElectionRetryDiscardsOldVotes(t *testing.T) {
 	cm, now := newTimerTestModule()
-	cm.tickElection(now.Add(150 * time.Millisecond))
-	cm.tickElection(now.Add(300 * time.Millisecond))
+	cm.tick(now.Add(150 * time.Millisecond))
+	cm.tick(now.Add(300 * time.Millisecond))
 	cm.handleRequestVoteReply(2, 1, RequestVoteReply{Term: 1, VoteGranted: true})
 	cm.handleRequestVoteReply(3, 2, RequestVoteReply{Term: 1, VoteGranted: true})
 	if cm.state != Candidate || len(cm.votesReceived) != 1 {
@@ -213,7 +213,7 @@ func TestElectionRetryDiscardsOldVotes(t *testing.T) {
 func TestHigherTermReplyStepsDown(t *testing.T) {
 	for _, state := range []CMState{Candidate, Leader} {
 		cm, now := newTimerTestModule()
-		cm.tickElection(now.Add(150 * time.Millisecond))
+		cm.tick(now.Add(150 * time.Millisecond))
 		cm.state = state
 		deadline := cm.electionDeadline
 		cm.handleRequestVoteReply(2, 0, RequestVoteReply{Term: 4})
@@ -266,7 +266,7 @@ func TestRequestVote(t *testing.T) {
 
 func TestHigherTermRequestStepsDown(t *testing.T) {
 	cm, now := newTimerTestModule()
-	cm.tickElection(now.Add(150 * time.Millisecond))
+	cm.tick(now.Add(150 * time.Millisecond))
 	var reply RequestVoteReply
 	cm.RequestVote(RequestVoteArgs{Term: 2, CandidateID: 2}, &reply)
 	if cm.state != Follower || cm.currentTerm != 2 || !reply.VoteGranted {
@@ -321,12 +321,12 @@ func TestHeartbeatsPreventElectionUntilContactStops(t *testing.T) {
 		at := now.Add(elapsed)
 		var reply AppendEntriesReply
 		cm.appendEntries(AppendEntriesArgs{Term: 1, LeaderID: 2}, &reply, at)
-		cm.tickElection(at)
+		cm.tick(at)
 		if cm.state != Follower || cm.currentTerm != 1 {
 			t.Fatal("follower started an election despite regular heartbeats")
 		}
 	}
-	cm.tickElection(now.Add(time.Second + 150*time.Millisecond))
+	cm.tick(now.Add(time.Second + 150*time.Millisecond))
 	if cm.state != Candidate || cm.currentTerm != 2 {
 		t.Fatal("follower did not start an election after heartbeats stopped")
 	}
@@ -335,16 +335,16 @@ func TestHeartbeatsPreventElectionUntilContactStops(t *testing.T) {
 func TestHeartbeatSchedule(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.state, cm.currentTerm = Leader, 1
-	cm.tickElection(now)
+	cm.tick(now)
 	want := now.Add(heartbeatInterval)
 	if !cm.heartbeatDeadline.Equal(want) {
 		t.Fatal("leader did not schedule its next heartbeat")
 	}
-	cm.tickElection(want.Add(-time.Millisecond))
+	cm.tick(want.Add(-time.Millisecond))
 	if !cm.heartbeatDeadline.Equal(want) {
 		t.Fatal("leader sent a heartbeat before the interval elapsed")
 	}
-	cm.tickElection(want)
+	cm.tick(want)
 	if !cm.heartbeatDeadline.Equal(want.Add(heartbeatInterval)) {
 		t.Fatal("leader did not schedule a periodic heartbeat")
 	}

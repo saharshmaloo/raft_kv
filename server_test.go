@@ -14,7 +14,7 @@ func TestServerLifecycle(t *testing.T) {
 	}
 	s := NewServer(1, []int{2})
 	if !s.cm.electionDeadline.IsZero() {
-		t.Fatal("election timer started before Serve")
+		t.Fatal("election deadline initialized before Serve")
 	}
 	if err := s.Serve(listener); err != nil {
 		listener.Close()
@@ -22,10 +22,10 @@ func TestServerLifecycle(t *testing.T) {
 	}
 	defer s.Shutdown()
 	s.cm.mu.Lock()
-	timerStarted := !s.cm.electionDeadline.IsZero()
+	deadlineInitialized := !s.cm.electionDeadline.IsZero()
 	s.cm.mu.Unlock()
-	if !timerStarted {
-		t.Fatal("Serve did not initialize the election timer")
+	if !deadlineInitialized {
+		t.Fatal("Serve did not initialize the election deadline")
 	}
 	peer := NewServer(2, []int{1})
 	defer peer.Shutdown()
@@ -37,7 +37,7 @@ func TestServerLifecycle(t *testing.T) {
 	select {
 	case <-s.cm.done:
 	default:
-		t.Fatal("Shutdown did not signal the election timer to stop")
+		t.Fatal("Shutdown did not signal the consensus ticker to stop")
 	}
 	if err := s.Call(2, "ConsensusModule.RequestVote", nil, nil); err == nil {
 		t.Fatal("closed server accepted a call")
@@ -65,7 +65,7 @@ func TestElectionRequestsVotesOverRPC(t *testing.T) {
 			<-finished
 		})
 	}
-	s.cm.tickElection(time.Unix(0, 0))
+	s.cm.tick(time.Unix(0, 0))
 	s.cm.wg.Wait() // Both outgoing calls and their reply handlers have completed.
 	if s.cm.state != Leader || s.cm.currentTerm != 1 {
 		t.Fatal("RPC votes did not elect the candidate")
@@ -83,7 +83,7 @@ func TestElectionRequestsVotesOverRPC(t *testing.T) {
 func TestFailedVoteRPCLeavesCandidate(t *testing.T) {
 	s := NewServer(1, []int{2, 3})
 	defer s.Shutdown()
-	s.cm.tickElection(time.Unix(0, 0))
+	s.cm.tick(time.Unix(0, 0))
 	s.cm.wg.Wait()
 	if s.cm.state != Candidate || len(s.cm.votesReceived) != 1 {
 		t.Fatal("disconnected peers must not count as votes")
