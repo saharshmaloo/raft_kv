@@ -5,10 +5,9 @@ import (
 	"net"
 	"net/rpc"
 	"sync"
-	"time"
 )
 
-// Server owns transport resources and drives the consensus clock.
+// Server owns RPC connections and coordinates node startup and shutdown.
 // ConsensusModule uses Call without knowing peer addresses or managing connections.
 type Server struct {
 	mu          sync.Mutex
@@ -17,9 +16,7 @@ type Server struct {
 	listener    net.Listener
 	peers       map[int]*rpc.Client
 	connections map[net.Conn]struct{}
-	heartbeats  map[int]bool
 	closed      bool
-	done        chan struct{}
 	wg          sync.WaitGroup
 }
 
@@ -28,60 +25,12 @@ func NewServer(id int, peerIds []int) *Server {
 		rpcServer:   rpc.NewServer(),
 		peers:       make(map[int]*rpc.Client),
 		connections: make(map[net.Conn]struct{}),
-		heartbeats:  make(map[int]bool),
-		done:        make(chan struct{}),
 	}
 	s.cm = newConsensusModule(id, peerIds, s)
 	if err := s.rpcServer.RegisterName("ConsensusModule", s.cm); err != nil {
 		panic(err) // A fixed service name/type failing registration is a programming error.
 	}
 	return s
-}
-
-// requestVote owns each outgoing election goroutine so Shutdown can close its
-// connection and wait for the reply handler to finish. Add is guarded by mu to
-// prevent starting new work once Shutdown begins waiting.
-func (s *Server) requestVote(peerID int, args RequestVoteArgs) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return
-	}
-	s.wg.Add(1)
-	s.mu.Unlock()
-	go func() {
-		defer s.wg.Done()
-		var reply RequestVoteReply
-		if err := s.Call(peerID, "ConsensusModule.RequestVote", args, &reply); err != nil {
-			return // A failed RPC is not a vote; the next timeout retries the election.
-		}
-		s.cm.handleRequestVoteReply(peerID, args.Term, reply)
-	}()
-}
-
-func (s *Server) sendHeartbeat(peerID int, args AppendEntriesArgs) {
-	s.mu.Lock()
-	// A stalled peer must not accumulate a goroutine on every heartbeat interval.
-	if s.closed || s.heartbeats[peerID] {
-		s.mu.Unlock()
-		return
-	}
-	s.heartbeats[peerID] = true
-	s.wg.Add(1)
-	s.mu.Unlock()
-	go func() {
-		defer s.wg.Done()
-		defer func() {
-			s.mu.Lock()
-			delete(s.heartbeats, peerID)
-			s.mu.Unlock()
-		}()
-		var reply AppendEntriesReply
-		if err := s.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err != nil {
-			return
-		}
-		s.cm.handleAppendEntriesReply(reply)
-	}()
 }
 
 // Serve takes ownership of listener, starts accepting RPC connections, and
@@ -93,16 +42,7 @@ func (s *Server) Serve(listener net.Listener) error {
 		return fmt.Errorf("server is closed or already serving")
 	}
 	s.listener = listener
-	s.cm.mu.Lock()
-	s.cm.resetElectionTimerLocked(time.Now())
-	s.cm.mu.Unlock()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		defer ticker.Stop()
-		s.cm.runElectionTimer(ticker.C, s.done)
-	}()
+	s.cm.start()
 	s.wg.Add(1)
 	go s.accept()
 	return nil
@@ -173,14 +113,11 @@ func (s *Server) Call(peerID int, method string, args, reply any) error {
 	return client.Call(method, args, reply)
 }
 
-// Shutdown stops the election timer, closes transport resources, and waits for
-// all server goroutines to finish. It is safe to call more than once.
+// Shutdown closes transport resources and stops consensus, waiting for both
+// network and protocol goroutines to finish. It is safe to call more than once.
 func (s *Server) Shutdown() {
 	s.mu.Lock()
-	if !s.closed {
-		s.closed = true
-		close(s.done)
-	}
+	s.closed = true
 	if s.listener != nil {
 		s.listener.Close()
 	}
@@ -191,5 +128,6 @@ func (s *Server) Shutdown() {
 		conn.Close()
 	}
 	s.mu.Unlock()
+	s.cm.stop()
 	s.wg.Wait()
 }

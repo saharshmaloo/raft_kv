@@ -113,6 +113,50 @@ func TestElectionTimerLoopAlreadyStopped(t *testing.T) {
 	}
 }
 
+func TestConsensusTimerLifecycle(t *testing.T) {
+	cm := newConsensusModule(1, nil, nil)
+	t.Cleanup(cm.stop)
+	if !cm.electionDeadline.IsZero() {
+		t.Fatal("construction started the election timer")
+	}
+	cm.start()
+	cm.mu.Lock()
+	deadline := cm.electionDeadline
+	cm.mu.Unlock()
+	if deadline.IsZero() {
+		t.Fatal("starting consensus did not initialize the election deadline")
+	}
+	cm.start()
+	cm.mu.Lock()
+	unchanged := cm.electionDeadline.Equal(deadline)
+	cm.mu.Unlock()
+	if !unchanged {
+		t.Fatal("starting consensus twice reset the election timer")
+	}
+	cm.stop()
+	cm.stop()
+	select {
+	case <-cm.done:
+	default:
+		t.Fatal("stopping consensus did not signal the timer")
+	}
+	term := cm.currentTerm
+	cm.start()
+	cm.tickElection(deadline.Add(time.Hour))
+	if cm.currentTerm != term {
+		t.Fatal("stopped consensus restarted an election")
+	}
+}
+
+func TestConsensusStopBeforeStart(t *testing.T) {
+	cm := newConsensusModule(1, nil, nil)
+	cm.stop()
+	cm.start()
+	if !cm.electionDeadline.IsZero() {
+		t.Fatal("stopped consensus started its election timer")
+	}
+}
+
 func TestSingleNodeElectsItself(t *testing.T) {
 	cm := newConsensusModule(1, nil, nil)
 	cm.tickElection(time.Unix(0, 0))

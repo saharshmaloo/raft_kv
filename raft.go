@@ -70,15 +70,23 @@ type ConsensusModule struct {
 	electionTimeout   func() time.Duration
 	votesReceived     map[int]bool // Grants in currentTerm, including our own vote.
 	heartbeatDeadline time.Time
+
+	heartbeats map[int]bool
+	started    bool
+	stopped    bool
+	done       chan struct{}
+	wg         sync.WaitGroup
 }
 
 func newConsensusModule(id int, peerIds []int, server *Server) *ConsensusModule {
 	return &ConsensusModule{
-		id:       id,
-		peerIds:  append([]int(nil), peerIds...),
-		server:   server,
-		votedFor: -1,
-		state:    Follower,
+		id:         id,
+		peerIds:    append([]int(nil), peerIds...),
+		server:     server,
+		votedFor:   -1,
+		state:      Follower,
+		heartbeats: make(map[int]bool),
+		done:       make(chan struct{}),
 		electionTimeout: func() time.Duration {
 			return 150*time.Millisecond + time.Duration(rand.Int63n(int64(150*time.Millisecond)))
 		},
@@ -97,6 +105,10 @@ func (cm *ConsensusModule) resetElectionTimerLocked(now time.Time) {
 // tickElection accepts time explicitly so protocol tests need no real sleeps.
 func (cm *ConsensusModule) tickElection(now time.Time) {
 	cm.mu.Lock()
+	if cm.stopped {
+		cm.mu.Unlock()
+		return
+	}
 	if cm.state == Leader {
 		cm.mu.Unlock()
 		cm.sendHeartbeats(now)
@@ -124,7 +136,7 @@ func (cm *ConsensusModule) tickElection(now time.Time) {
 	// timer, incoming RPCs, or a majority of other peers from electing us.
 	if cm.server != nil {
 		for _, peerID := range cm.peerIds {
-			cm.server.requestVote(peerID, args)
+			cm.requestVote(peerID, args)
 		}
 	}
 }
@@ -184,7 +196,7 @@ func (cm *ConsensusModule) sendHeartbeats(now time.Time) {
 	cm.mu.Unlock()
 	if cm.server != nil {
 		for _, peerID := range cm.peerIds {
-			cm.server.sendHeartbeat(peerID, args)
+			cm.sendHeartbeat(peerID, args)
 		}
 	}
 }
@@ -240,8 +252,82 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	return nil
 }
 
-// runElectionTimer adapts clock ticks to protocol logic. Server owns the clock
-// and stop signal; tests can supply ticks directly.
+// requestVote tracks outgoing work so stopping consensus waits for reply handling.
+func (cm *ConsensusModule) requestVote(peerID int, args RequestVoteArgs) {
+	cm.mu.Lock()
+	if cm.stopped {
+		cm.mu.Unlock()
+		return
+	}
+	cm.wg.Add(1)
+	cm.mu.Unlock()
+	go func() {
+		defer cm.wg.Done()
+		var reply RequestVoteReply
+		if err := cm.server.Call(peerID, "ConsensusModule.RequestVote", args, &reply); err != nil {
+			return // A failed RPC is not a vote; the next timeout retries the election.
+		}
+		cm.handleRequestVoteReply(peerID, args.Term, reply)
+	}()
+}
+
+func (cm *ConsensusModule) sendHeartbeat(peerID int, args AppendEntriesArgs) {
+	cm.mu.Lock()
+	// A stalled peer must not accumulate a goroutine on every heartbeat interval.
+	if cm.stopped || cm.heartbeats[peerID] {
+		cm.mu.Unlock()
+		return
+	}
+	cm.heartbeats[peerID] = true
+	cm.wg.Add(1)
+	cm.mu.Unlock()
+	go func() {
+		defer cm.wg.Done()
+		defer func() {
+			cm.mu.Lock()
+			delete(cm.heartbeats, peerID)
+			cm.mu.Unlock()
+		}()
+		var reply AppendEntriesReply
+		if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err != nil {
+			return
+		}
+		cm.handleAppendEntriesReply(reply)
+	}()
+}
+
+// start initializes the deadline before launching the clock, so the first tick
+// waits for a full election timeout. Construction alone does not start elections.
+func (cm *ConsensusModule) start() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.started || cm.stopped {
+		return
+	}
+	cm.started = true
+	cm.resetElectionTimerLocked(time.Now())
+	ticker := time.NewTicker(10 * time.Millisecond)
+	cm.wg.Add(1)
+	go func() {
+		defer cm.wg.Done()
+		defer ticker.Stop()
+		cm.runElectionTimer(ticker.C, cm.done)
+	}()
+}
+
+// stop prevents new protocol goroutines before waiting for existing work.
+// The transport must close connections first to unblock pending RPCs.
+func (cm *ConsensusModule) stop() {
+	cm.mu.Lock()
+	if !cm.stopped {
+		cm.stopped = true
+		close(cm.done)
+	}
+	cm.mu.Unlock()
+	cm.wg.Wait()
+}
+
+// runElectionTimer adapts clock ticks to protocol logic; tests can supply ticks directly.
 func (cm *ConsensusModule) runElectionTimer(ticks <-chan time.Time, stop <-chan struct{}) {
 	for {
 		select {

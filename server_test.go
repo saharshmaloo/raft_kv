@@ -35,7 +35,7 @@ func TestServerLifecycle(t *testing.T) {
 	s.Shutdown()
 	s.Shutdown()
 	select {
-	case <-s.done:
+	case <-s.cm.done:
 	default:
 		t.Fatal("Shutdown did not signal the election timer to stop")
 	}
@@ -66,7 +66,7 @@ func TestElectionRequestsVotesOverRPC(t *testing.T) {
 		})
 	}
 	s.cm.tickElection(time.Unix(0, 0))
-	s.wg.Wait() // Both outgoing calls and their reply handlers have completed.
+	s.cm.wg.Wait() // Both outgoing calls and their reply handlers have completed.
 	if s.cm.state != Leader || s.cm.currentTerm != 1 {
 		t.Fatal("RPC votes did not elect the candidate")
 	}
@@ -84,7 +84,7 @@ func TestFailedVoteRPCLeavesCandidate(t *testing.T) {
 	s := NewServer(1, []int{2, 3})
 	defer s.Shutdown()
 	s.cm.tickElection(time.Unix(0, 0))
-	s.wg.Wait()
+	s.cm.wg.Wait()
 	if s.cm.state != Candidate || len(s.cm.votesReceived) != 1 {
 		t.Fatal("disconnected peers must not count as votes")
 	}
@@ -123,7 +123,7 @@ func TestWinningVoteSendsImmediateHeartbeat(t *testing.T) {
 	s.cm.votesReceived = map[int]bool{1: true}
 	peer.cm.state, peer.cm.currentTerm, peer.cm.votedFor = Candidate, 1, 2
 	s.cm.handleRequestVoteReply(2, 1, RequestVoteReply{Term: 1, VoteGranted: true})
-	s.wg.Wait()
+	s.cm.wg.Wait()
 	peer.cm.mu.Lock()
 	defer peer.cm.mu.Unlock()
 	if peer.cm.state != Follower || peer.cm.votedFor != 2 || peer.cm.electionDeadline.IsZero() {
@@ -138,7 +138,7 @@ func TestShutdownUnblocksStalledHeartbeat(t *testing.T) {
 	defer remote.Close()
 	s.peers[2] = rpc.NewClient(local)
 	// With no reader on the other end, sending the request blocks until shutdown.
-	s.sendHeartbeat(2, AppendEntriesArgs{Term: 1, LeaderID: 1})
+	s.cm.sendHeartbeat(2, AppendEntriesArgs{Term: 1, LeaderID: 1})
 	finished := make(chan struct{})
 	go func() {
 		s.Shutdown()
