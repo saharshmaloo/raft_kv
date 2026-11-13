@@ -1,18 +1,12 @@
 package raft
 
 import (
+	"net/rpc"
 	"testing"
 	"time"
 )
 
-func newTimerTestModule() (*ConsensusModule, time.Time) {
-	cm := newConsensusModule(1, []int{2, 3}, nil)
-	cm.electionTimeout = func() time.Duration { return 150 * time.Millisecond }
-	now := time.Unix(0, 0)
-	cm.resetElectionTimerLocked(now)
-	return cm, now
-}
-
+// Reaching the deadline begins a new term with a self-vote; earlier ticks do nothing.
 func TestElectionTimeout(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.tick(now.Add(149 * time.Millisecond))
@@ -25,6 +19,7 @@ func TestElectionTimeout(t *testing.T) {
 	}
 }
 
+// A failed election gets a full newly sampled timeout before another term begins.
 func TestCandidateRetriesWithFreshTimeout(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.electionTimeout = func() time.Duration { return 250 * time.Millisecond }
@@ -39,6 +34,7 @@ func TestCandidateRetriesWithFreshTimeout(t *testing.T) {
 	}
 }
 
+// Resetting the deadline prevents an election at the superseded deadline.
 func TestElectionTimerReset(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.mu.Lock()
@@ -54,6 +50,7 @@ func TestElectionTimerReset(t *testing.T) {
 	}
 }
 
+// Passing an election deadline must not make a leader campaign again.
 func TestLeaderIgnoresElectionTimeout(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.state = Leader
@@ -64,6 +61,7 @@ func TestLeaderIgnoresElectionTimeout(t *testing.T) {
 	}
 }
 
+// A late tick starts one election rather than replaying every missed timeout.
 func TestDelayedTickStartsOnlyOneElection(t *testing.T) {
 	cm, now := newTimerTestModule()
 	late := now.Add(time.Hour)
@@ -74,8 +72,9 @@ func TestDelayedTickStartsOnlyOneElection(t *testing.T) {
 	}
 }
 
+// Sampled timeouts stay within the configured [150 ms, 300 ms) interval.
 func TestRandomElectionTimeoutRange(t *testing.T) {
-	cm := newConsensusModule(1, nil, nil)
+	cm := NewConsensusModule(1, nil, nil)
 	for i := 0; i < 100; i++ {
 		timeout := cm.electionTimeout()
 		if timeout < 150*time.Millisecond || timeout >= 300*time.Millisecond {
@@ -84,87 +83,16 @@ func TestRandomElectionTimeoutRange(t *testing.T) {
 	}
 }
 
-func TestTickerLoop(t *testing.T) {
-	cm, now := newTimerTestModule()
-	ticks := make(chan time.Time)
-	stop := make(chan struct{})
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		cm.runTicker(ticks, stop)
-	}()
-	// The second send ensures the loop has processed the first tick.
-	ticks <- now.Add(150 * time.Millisecond)
-	ticks <- now.Add(151 * time.Millisecond)
-	close(stop)
-	<-finished
-	if cm.state != Candidate || cm.currentTerm != 1 {
-		t.Fatal("ticker loop did not deliver the timeout")
-	}
-}
-
-func TestTickerLoopAlreadyStopped(t *testing.T) {
-	cm, _ := newTimerTestModule()
-	stop := make(chan struct{})
-	close(stop)
-	cm.runTicker(make(chan time.Time), stop)
-	if cm.state != Follower || cm.currentTerm != 0 {
-		t.Fatal("stopped ticker changed consensus state")
-	}
-}
-
-func TestConsensusTickerLifecycle(t *testing.T) {
-	cm := newConsensusModule(1, nil, nil)
-	t.Cleanup(cm.stop)
-	if !cm.electionDeadline.IsZero() {
-		t.Fatal("construction initialized the election deadline")
-	}
-	cm.start()
-	cm.mu.Lock()
-	deadline := cm.electionDeadline
-	cm.mu.Unlock()
-	if deadline.IsZero() {
-		t.Fatal("starting consensus did not initialize the election deadline")
-	}
-	cm.start()
-	cm.mu.Lock()
-	unchanged := cm.electionDeadline.Equal(deadline)
-	cm.mu.Unlock()
-	if !unchanged {
-		t.Fatal("starting consensus twice reset the election deadline")
-	}
-	cm.stop()
-	cm.stop()
-	select {
-	case <-cm.done:
-	default:
-		t.Fatal("stopping consensus did not signal the ticker")
-	}
-	term := cm.currentTerm
-	cm.start()
-	cm.tick(deadline.Add(time.Hour))
-	if cm.currentTerm != term {
-		t.Fatal("stopped consensus restarted an election")
-	}
-}
-
-func TestConsensusStopBeforeStart(t *testing.T) {
-	cm := newConsensusModule(1, nil, nil)
-	cm.stop()
-	cm.start()
-	if !cm.electionDeadline.IsZero() {
-		t.Fatal("stopped consensus initialized its election deadline")
-	}
-}
-
+// A single-node cluster wins immediately because its self-vote is a majority.
 func TestSingleNodeElectsItself(t *testing.T) {
-	cm := newConsensusModule(1, nil, nil)
+	cm := NewConsensusModule(1, nil, nil)
 	cm.tick(time.Unix(0, 0))
 	if cm.state != Leader || cm.currentTerm != 1 || cm.votedFor != 1 {
 		t.Fatal("a single node's self-vote is a majority")
 	}
 }
 
+// Duplicate grants and rejections cannot inflate the majority count.
 func TestCandidateNeedsDistinctMajority(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.peerIds = []int{2, 3, 4, 5}
@@ -181,6 +109,7 @@ func TestCandidateNeedsDistinctMajority(t *testing.T) {
 	}
 }
 
+// Exactly half the votes cannot elect a leader in an even-sized cluster.
 func TestEvenClusterNeedsMoreThanHalf(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.peerIds = []int{2, 3, 4}
@@ -195,6 +124,7 @@ func TestEvenClusterNeedsMoreThanHalf(t *testing.T) {
 	}
 }
 
+// Delayed grants count only when both the election and reply terms match.
 func TestElectionRetryDiscardsOldVotes(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.tick(now.Add(150 * time.Millisecond))
@@ -210,6 +140,7 @@ func TestElectionRetryDiscardsOldVotes(t *testing.T) {
 	}
 }
 
+// A higher term overrides leadership even in an old reply, without resetting the deadline.
 func TestHigherTermReplyStepsDown(t *testing.T) {
 	for _, state := range []CMState{Candidate, Leader} {
 		cm, now := newTimerTestModule()
@@ -230,6 +161,7 @@ func TestHigherTermReplyStepsDown(t *testing.T) {
 	}
 }
 
+// Votes honor term and prior-vote rules; only a granted vote postpones an election.
 func TestRequestVote(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -264,6 +196,7 @@ func TestRequestVote(t *testing.T) {
 	}
 }
 
+// A candidate adopts a higher term before considering the incoming vote request.
 func TestHigherTermRequestStepsDown(t *testing.T) {
 	cm, now := newTimerTestModule()
 	cm.tick(now.Add(150 * time.Millisecond))
@@ -274,92 +207,38 @@ func TestHigherTermRequestStepsDown(t *testing.T) {
 	}
 }
 
-func TestAppendEntries(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		state     CMState
-		term      int
-		wantTerm  int
-		wantVote  int
-		wantState CMState
-		accepted  bool
-	}{
-		{"stale heartbeat", Candidate, 1, 2, 1, Candidate, false},
-		{"same term follower", Follower, 2, 2, 1, Follower, true},
-		{"same term candidate", Candidate, 2, 2, 1, Follower, true},
-		{"higher term candidate", Candidate, 3, 3, -1, Follower, true},
-		{"higher term leader", Leader, 3, 3, -1, Follower, true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			cm, now := newTimerTestModule()
-			cm.state, cm.currentTerm, cm.votedFor = test.state, 2, 1
-			cm.votesReceived = map[int]bool{1: true}
-			deadline := cm.electionDeadline
-			var reply AppendEntriesReply
-			if err := cm.appendEntries(AppendEntriesArgs{Term: test.term, LeaderID: 2}, &reply, now.Add(100*time.Millisecond)); err != nil {
-				t.Fatal(err)
-			}
-			if reply.Term != test.wantTerm || reply.Success != test.accepted || cm.currentTerm != test.wantTerm || cm.state != test.wantState || cm.votedFor != test.wantVote {
-				t.Fatalf("unexpected heartbeat result: reply=%+v state=%v term=%d vote=%d", reply, cm.state, cm.currentTerm, cm.votedFor)
-			}
-			if test.accepted {
-				deadline = now.Add(250 * time.Millisecond)
-				if cm.votesReceived != nil {
-					t.Fatal("leader contact did not discard election grants")
-				}
-			}
-			if !cm.electionDeadline.Equal(deadline) {
-				t.Fatal("heartbeat changed the election deadline incorrectly")
-			}
-		})
+// Real RPC exchanges over in-memory connections must produce a majority and leadership.
+func TestElectionRequestsVotesOverRPC(t *testing.T) {
+	transport := &rpcTestTransport{clients: make(map[int]*rpc.Client)}
+	cm := NewConsensusModule(1, []int{2, 3}, transport)
+	t.Cleanup(cm.Stop)
+	peers := []*ConsensusModule{NewConsensusModule(2, nil, nil), NewConsensusModule(3, nil, nil)}
+	for _, peer := range peers {
+		connectTestPeer(t, transport, peer)
 	}
-}
-
-func TestHeartbeatsPreventElectionUntilContactStops(t *testing.T) {
-	cm, now := newTimerTestModule()
-	for elapsed := heartbeatInterval; elapsed <= time.Second; elapsed += heartbeatInterval {
-		at := now.Add(elapsed)
-		var reply AppendEntriesReply
-		cm.appendEntries(AppendEntriesArgs{Term: 1, LeaderID: 2}, &reply, at)
-		cm.tick(at)
-		if cm.state != Follower || cm.currentTerm != 1 {
-			t.Fatal("follower started an election despite regular heartbeats")
+	cm.tick(time.Unix(0, 0))
+	cm.wg.Wait() // Outgoing calls and reply handling must complete before observation.
+	if cm.state != Leader || cm.currentTerm != 1 {
+		t.Fatal("RPC votes did not elect the candidate")
+	}
+	for _, peer := range peers {
+		peer.mu.Lock()
+		votedFor, term := peer.votedFor, peer.currentTerm
+		peer.mu.Unlock()
+		if votedFor != 1 || term != 1 {
+			t.Fatal("candidate did not request a vote from every peer")
 		}
 	}
-	cm.tick(now.Add(time.Second + 150*time.Millisecond))
-	if cm.state != Candidate || cm.currentTerm != 2 {
-		t.Fatal("follower did not start an election after heartbeats stopped")
-	}
 }
 
-func TestHeartbeatSchedule(t *testing.T) {
-	cm, now := newTimerTestModule()
-	cm.state, cm.currentTerm = Leader, 1
-	cm.tick(now)
-	want := now.Add(heartbeatInterval)
-	if !cm.heartbeatDeadline.Equal(want) {
-		t.Fatal("leader did not schedule its next heartbeat")
-	}
-	cm.tick(want.Add(-time.Millisecond))
-	if !cm.heartbeatDeadline.Equal(want) {
-		t.Fatal("leader sent a heartbeat before the interval elapsed")
-	}
-	cm.tick(want)
-	if !cm.heartbeatDeadline.Equal(want.Add(heartbeatInterval)) {
-		t.Fatal("leader did not schedule a periodic heartbeat")
-	}
-}
-
-func TestHeartbeatReplyHigherTermStepsDown(t *testing.T) {
-	cm, _ := newTimerTestModule()
-	cm.state, cm.currentTerm, cm.votedFor = Leader, 2, 1
-	deadline := cm.electionDeadline
-	cm.handleAppendEntriesReply(AppendEntriesReply{Term: 1, Success: true})
-	if cm.state != Leader || cm.currentTerm != 2 {
-		t.Fatal("stale heartbeat reply changed leadership")
-	}
-	cm.handleAppendEntriesReply(AppendEntriesReply{Term: 3})
-	if cm.state != Follower || cm.currentTerm != 3 || cm.votedFor != -1 || !cm.electionDeadline.Equal(deadline) {
-		t.Fatal("higher-term heartbeat reply must step down without resetting the timer")
+// Unreachable peers supply no votes, leaving the candidate short of a majority.
+func TestFailedVoteRPCLeavesCandidate(t *testing.T) {
+	transport := &rpcTestTransport{}
+	cm := NewConsensusModule(1, []int{2, 3}, transport)
+	defer cm.Stop()
+	cm.tick(time.Unix(0, 0))
+	cm.wg.Wait()
+	if cm.state != Candidate || len(cm.votesReceived) != 1 {
+		t.Fatal("disconnected peers must not count as votes")
 	}
 }

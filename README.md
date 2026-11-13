@@ -14,9 +14,11 @@ Raft helps a group of nodes agree on an ordered sequence of operations, even whe
 
 ## Project layout
 
-- `raft.go` — node state, election timing, and voting.
-- `server.go` — peer connections, RPC transport, and server lifecycle.
-- `*_test.go` — protocol and transport tests.
+- `node.go` — consensus and transport wiring, node startup, and shutdown.
+- `raft/` — protocol state, ticking, elections, heartbeats, and RPC types.
+- `transport/` — TCP listeners, peer connections, and RPC serving.
+- `integration/` — cluster scenarios and fault injection helpers.
+- `*_test.go` — unit tests alongside each component.
 
 ## Getting started
 
@@ -25,5 +27,20 @@ Requires Go 1.21 or later.
 ```sh
 git clone https://github.com/saharshmaloo/raft_kv.git
 cd raft_kv
+```
+
+## Testing
+
+Unit tests check election timing, voting, and RPC behavior. Integration and
+end-to-end tests run five-node TCP clusters with partitions, request and reply
+loss, delays, disconnections, and node shutdowns to check election safety,
+leader stability, and recovery.
+
+Run all tests with the race detector:
+
+```sh
 go test -race ./...
 ```
+
+Set `RAFT_TEST_SEED` to choose a different randomized fault sequence; concurrent
+RPC scheduling can still vary between runs.

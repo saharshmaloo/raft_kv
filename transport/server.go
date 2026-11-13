@@ -1,4 +1,4 @@
-package raft
+package transport
 
 import (
 	"fmt"
@@ -7,11 +7,9 @@ import (
 	"sync"
 )
 
-// Server owns RPC connections and coordinates node startup and shutdown.
-// ConsensusModule uses Call without knowing peer addresses or managing connections.
+// Server owns TCP listeners, peer connections, and RPC serving.
 type Server struct {
 	mu          sync.Mutex
-	cm          *ConsensusModule
 	rpcServer   *rpc.Server
 	listener    net.Listener
 	peers       map[int]*rpc.Client
@@ -20,22 +18,21 @@ type Server struct {
 	wg          sync.WaitGroup
 }
 
-func NewServer(id int, peerIds []int) *Server {
-	s := &Server{
+// NewServer constructs an RPC transport without opening a listener.
+func NewServer() *Server {
+	return &Server{
 		rpcServer:   rpc.NewServer(),
 		peers:       make(map[int]*rpc.Client),
 		connections: make(map[net.Conn]struct{}),
 	}
-	s.cm = newConsensusModule(id, peerIds, s)
-	if err := s.rpcServer.RegisterName("ConsensusModule", s.cm); err != nil {
-		panic(err) // A fixed service name/type failing registration is a programming error.
-	}
-	return s
 }
 
-// Serve takes ownership of listener, starts accepting RPC connections, and
-// starts the consensus ticker for elections and heartbeats. Construction alone
-// does not start consensus.
+// Register exposes a receiver's RPC methods. Call it before Serve.
+func (s *Server) Register(name string, receiver any) error {
+	return s.rpcServer.RegisterName(name, receiver)
+}
+
+// Serve takes ownership of listener and starts accepting RPC connections.
 func (s *Server) Serve(listener net.Listener) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -43,7 +40,6 @@ func (s *Server) Serve(listener net.Listener) error {
 		return fmt.Errorf("server is closed or already serving")
 	}
 	s.listener = listener
-	s.cm.start()
 	s.wg.Add(1)
 	go s.accept()
 	return nil
@@ -98,6 +94,16 @@ func (s *Server) ConnectToPeer(peerID int, address string) error {
 	return nil
 }
 
+// DisconnectPeer closes an outgoing connection. ConnectToPeer can reconnect it.
+func (s *Server) DisconnectPeer(peerID int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if client := s.peers[peerID]; client != nil {
+		client.Close()
+		delete(s.peers, peerID)
+	}
+}
+
 // Call sends an RPC using a method name such as "ConsensusModule.RequestVote".
 // The mutex protects the connection map, not the duration of a network call.
 func (s *Server) Call(peerID int, method string, args, reply any) error {
@@ -114,8 +120,8 @@ func (s *Server) Call(peerID int, method string, args, reply any) error {
 	return client.Call(method, args, reply)
 }
 
-// Shutdown closes transport resources and stops consensus, waiting for both
-// network and protocol goroutines to finish. It is safe to call more than once.
+// Shutdown closes transport resources and waits for RPC serving to finish.
+// It is safe to call more than once.
 func (s *Server) Shutdown() {
 	s.mu.Lock()
 	s.closed = true
@@ -129,6 +135,5 @@ func (s *Server) Shutdown() {
 		conn.Close()
 	}
 	s.mu.Unlock()
-	s.cm.stop()
 	s.wg.Wait()
 }
