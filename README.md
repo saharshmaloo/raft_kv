@@ -2,8 +2,6 @@
 
 A Go implementation of the [Raft consensus algorithm](https://raft.github.io/raft.pdf) for a distributed key-value store.
 
-The project separates consensus logic from RPC networking so protocol behavior can be tested independently.
-
 ## How Raft works
 
 Raft helps a group of nodes agree on an ordered sequence of operations, even when some nodes fail or lose connectivity. Each node keeps a log of operations and applies committed entries in the same order to maintain a consistent state.
